@@ -1,0 +1,4 @@
+config:
+  airflow:dbPassword:
+    secure: AAABABfrDCgxh4IOZo7erb6zgKODr6Q/3BkmcrsQs8htMdbr79ty9G/M
+  aws:region: us-east-2
