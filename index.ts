@@ -9,8 +9,24 @@ const dbPassword = config.requireSecret("dbPassword");
 
 const vpc = new aws.ec2.DefaultVpc('default', { tags: { Name: 'Default VPC' } })
 
+const ubuntu = aws.ec2.getAmi({
+  mostRecent: true,
+  filters: [
+      {
+          name: "name",
+          values: ["ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*"],
+      },
+      {
+          name: "virtualization-type",
+          values: ["hvm"],
+      },
+  ],
+  owners: ["099720109477"],
+});
+
 const launchConfiguration = new aws.ec2.LaunchConfiguration('airflow-launch', {
-  imageId: 'i-0c2f489b56ed0ac7f',
+  namePrefix: 'teste-dan',
+  imageId: ubuntu.then(ubuntu => ubuntu.id), //https://www.pulumi.com/registry/packages/aws/api-docs/ec2/launchconfiguration/
   instanceType: "t2.xlarge",
 })
 
@@ -27,10 +43,10 @@ const subnets = zones.then(zones =>
     })));
 
 const autoScalingGroup = new aws.autoscaling.Group('airflow', {
-  vpcZoneIdentifiers: cidrs,
+  availabilityZones: zones.then(zones => zones.names),
   minSize: 4,
   maxSize: 4,
-  launchConfiguration: 'airflow-launch'
+  launchConfiguration: launchConfiguration.name//'airflow-launch'
 })
 const securityGroupIds = [vpc.defaultSecurityGroupId]
 const cluster = new aws.ecs.Cluster('airflow-cluster', {})
@@ -82,11 +98,18 @@ const environment = hosts.apply(([postgresHost, redisHost]) => [
 ]);
 
 
-const airflowLoadBalancer = new aws.lb.LoadBalancer("airflow-load-balancer", {});
+const airflowLoadBalancer = new aws.lb.LoadBalancer("airflow-load-balancer", {subnets:subnetIds});
+
+const controllerListenerTargetGroup = new aws.lb.TargetGroup('controller-target-group', {
+  port: 8080,
+  protocol: 'HTTP',
+  vpcId: vpc.id,
+});
 
 const airflowControllerListener = new aws.lb.Listener("airflow-controller-listener", {
   defaultActions: [{
     type: "forward",
+    targetGroupArn: controllerListenerTargetGroup.arn,
   }],
   loadBalancerArn: airflowLoadBalancer.arn,
   port: 8080,
@@ -104,23 +127,26 @@ const schedulerImage = new awsx.ecr.Image("scheduler", { repositoryUrl: repo.rep
 
 const serverSchedulerTaskDefinition = new aws.ecs.TaskDefinition('server-scheduler-task-definition', {
   family: 'my-special-family',
-  containerDefinitions: JSON.stringify([
+  containerDefinitions: pulumi // https://www.pulumi.com/docs/concepts/inputs-outputs/#outputs-and-json
+  .all(([webserverImage.imageUri, schedulerImage.imageUri,airflowControllerListener,environment]))
+  .apply( ([serverUri,schedulerUri,listener,environment]) =>
+   JSON.stringify([
     {
       name: "webserver",
-      image: webserverImage.imageUri,
+      image: serverUri,
       memory: 128,
-      portMappings: [airflowControllerListener],
+      portMappings: [{containerPort: 8080, hostPort: 8080,}],//[listener],
       environment: environment,
       command: ['webserver']
     },
     {
       name: "scheduler",
-      image: schedulerImage.imageUri,
+      image: schedulerUri,
       memory: 128,
       environment: environment,
       command: ['scheduler']
     },
-  ])
+  ]))
 },)
 
 const airflowController = new aws.ecs.Service('airflow-controller', {
@@ -129,9 +155,16 @@ const airflowController = new aws.ecs.Service('airflow-controller', {
   taskDefinition: serverSchedulerTaskDefinition.arn
 })
 
+const airflowerTargetGroup = new aws.lb.TargetGroup('airflower-target-group', {
+  port: 5555,
+  protocol: 'HTTP',
+  vpcId: vpc.id,
+});
+
 const airflowerListener = new aws.lb.Listener("airflower-listener", {
   defaultActions: [{
     type: "forward",
+    targetGroupArn: airflowerTargetGroup.arn
   }],
   loadBalancerArn: airflowLoadBalancer.arn,
   port: 5555,
@@ -141,21 +174,24 @@ const airflowerImage = new awsx.ecr.Image("notflower", { repositoryUrl: repo.rep
 
 const flowerTaskDefinition = new aws.ecs.TaskDefinition('flower-task-definition', {
   family: 'my-special-family',
-  containerDefinitions: JSON.stringify([
+  containerDefinitions: pulumi.
+  all([airflowerImage.imageUri, airflowerListener, environment])
+  .apply(([image, listener, environment]) =>
+    JSON.stringify([
     // If the container is named "flower", we create environment variables that start
     // with `FLOWER_` and Flower tries and fails to parse them as configuration.
     {
       name: "notflower",
-      image: airflowerImage.imageUri,
+      image: image,
       memory: 128,
-      portMappings: [airflowerListener],
+      portMappings: [{containerPort: 5555, hostPort: 5555,}],//[listener]
       environment: environment,
       command: ['flower']
     }
-  ])
+  ]))
 })
 
-const airflower = new aws.ecs.Service('airflow-controller', {
+const airflower = new aws.ecs.Service('airflower', {
   cluster: cluster.arn,
   taskDefinition: flowerTaskDefinition.arn
 })
@@ -164,17 +200,20 @@ const workerImage = new awsx.ecr.Image("worker", { repositoryUrl: repo.repositor
 
 const workerTaskDefinition = new aws.ecs.TaskDefinition('worker-task-definition', {
   family: 'my-special-family',
-  containerDefinitions: JSON.stringify([
+  containerDefinitions:pulumi
+  .all([workerImage.imageUri, environment])
+  .apply( ([image, environment]) =>
+    JSON.stringify([
     // If the container is named "flower", we create environment variables that start
     // with `FLOWER_` and Flower tries and fails to parse them as configuration.
     {
       name: "worker",
-      image: workerImage.imageUri,
+      image: image,
       memory: 1024,
       environment: environment,
       command: ['worker']
     }
-  ])
+  ]))
 })
 
 const airflowWorkers = new aws.ecs.Service("airflow-workers", {
