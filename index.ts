@@ -9,6 +9,7 @@ const dbPassword = config.requireSecret("dbPassword");
 
 const vpc = new aws.ec2.DefaultVpc('default', { tags: { Name: 'Default VPC' } })
 
+/*
 const ubuntu = aws.ec2.getAmi({
   mostRecent: true,
   filters: [
@@ -30,6 +31,20 @@ const launchConfiguration = new aws.ec2.LaunchConfiguration('airflow-launch', {
   instanceType: "t2.xlarge",
 })
 
+const autoScalingGroup = new aws.autoscaling.Group('airflow', {
+  availabilityZones: zones.then(zones => zones.names),
+  minSize: 4,
+  maxSize: 4,
+  launchConfiguration: launchConfiguration.name//'airflow-launch'
+})
+
+
+const capacityProvider = new aws.ecs.CapacityProvider('airflow-capacity-provider', {
+  autoScalingGroupProvider:{
+    autoScalingGroupArn:autoScalingGroup.arn,
+  },
+})
+*/
 const cidrs = ['172.31.112.0/20', '172.31.128.0/20', '172.31.144.0/20', '172.31.160.0/20'];
 const zones = aws.getAvailabilityZones()
 const subnets = zones.then(zones =>
@@ -42,14 +57,42 @@ const subnets = zones.then(zones =>
       tags: { Name: 'subnet_' + name, },
     })));
 
-const autoScalingGroup = new aws.autoscaling.Group('airflow', {
-  availabilityZones: zones.then(zones => zones.names),
-  minSize: 4,
-  maxSize: 4,
-  launchConfiguration: launchConfiguration.name//'airflow-launch'
-})
 const securityGroupIds = [vpc.defaultSecurityGroupId]
-const cluster = new aws.ecs.Cluster('airflow-cluster', {})
+
+const testRole = new aws.iam.Role("testRole", {
+  assumeRolePolicy:JSON.stringify({
+    Version: "2012-10-17",
+    Statement: [
+      {
+        Sid: "",
+        Effect: "Allow",
+        Principal: {
+          Service: "ecs-tasks.amazonaws.com"
+        },
+        "Action": "sts:AssumeRole"
+      }
+    ]
+  }),
+
+  managedPolicyArns: ['arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy',],
+});
+
+const cluster = new aws.ecs.Cluster('airflow-cluster', {
+  configuration: {
+    
+  }
+})
+
+const clusterCapacityProviders = new aws.ecs.ClusterCapacityProviders("airflow-cluster-capacity-providers", {
+    clusterName: cluster.name,
+    capacityProviders: ['FARGATE'],//[capacityProvider.name],
+    defaultCapacityProviderStrategies: [{
+        base: 1,
+        weight: 100,
+        capacityProvider: 'FARGATE',//capacityProvider.name,
+    }],
+});
+
 
 
 const subnetIds = subnets.then(nets => nets.map(n => n.id))
@@ -100,16 +143,17 @@ const environment = hosts.apply(([postgresHost, redisHost]) => [
 
 const airflowLoadBalancer = new aws.lb.LoadBalancer("airflow-load-balancer", {subnets:subnetIds});
 
-const controllerListenerTargetGroup = new aws.lb.TargetGroup('controller-target-group', {
+const controllerTargetGroup = new aws.lb.TargetGroup('controller-target-group', {
   port: 8080,
   protocol: 'HTTP',
+  targetType:'ip',
   vpcId: vpc.id,
 });
 
 const airflowControllerListener = new aws.lb.Listener("airflow-controller-listener", {
   defaultActions: [{
     type: "forward",
-    targetGroupArn: controllerListenerTargetGroup.arn,
+    targetGroupArn: controllerTargetGroup.arn,
   }],
   loadBalancerArn: airflowLoadBalancer.arn,
   port: 8080,
@@ -127,6 +171,12 @@ const schedulerImage = new awsx.ecr.Image("scheduler", { repositoryUrl: repo.rep
 
 const serverSchedulerTaskDefinition = new aws.ecs.TaskDefinition('server-scheduler-task-definition', {
   family: 'my-special-family',
+  taskRoleArn : testRole.arn,
+  executionRoleArn: testRole.arn,
+  requiresCompatibilities:['FARGATE'],
+  cpu:"1024",
+  memory:'2048',
+  networkMode:'awsvpc',
   containerDefinitions: pulumi // https://www.pulumi.com/docs/concepts/inputs-outputs/#outputs-and-json
   .all(([webserverImage.imageUri, schedulerImage.imageUri,airflowControllerListener,environment]))
   .apply( ([serverUri,schedulerUri,listener,environment]) =>
@@ -152,13 +202,24 @@ const serverSchedulerTaskDefinition = new aws.ecs.TaskDefinition('server-schedul
 const airflowController = new aws.ecs.Service('airflow-controller', {
   desiredCount: 1,
   cluster: cluster.arn,
-  taskDefinition: serverSchedulerTaskDefinition.arn
+  networkConfiguration:{
+    assignPublicIp:true,
+    subnets: subnetIds,
+    securityGroups:securityGroupIds,
+  },
+  taskDefinition: serverSchedulerTaskDefinition.arn,
+  loadBalancers:[{
+    targetGroupArn: controllerTargetGroup.arn,
+    containerName:'webserver',
+    containerPort:8080,
+  }],
 })
 
 const airflowerTargetGroup = new aws.lb.TargetGroup('airflower-target-group', {
   port: 5555,
   protocol: 'HTTP',
   vpcId: vpc.id,
+  targetType:'ip',
 });
 
 const airflowerListener = new aws.lb.Listener("airflower-listener", {
@@ -174,6 +235,12 @@ const airflowerImage = new awsx.ecr.Image("notflower", { repositoryUrl: repo.rep
 
 const flowerTaskDefinition = new aws.ecs.TaskDefinition('flower-task-definition', {
   family: 'my-special-family',
+  taskRoleArn : testRole.arn,
+  executionRoleArn: testRole.arn,
+  requiresCompatibilities:['FARGATE'],
+  cpu:"1024",
+  memory:'2048',
+  networkMode:'awsvpc',
   containerDefinitions: pulumi.
   all([airflowerImage.imageUri, airflowerListener, environment])
   .apply(([image, listener, environment]) =>
@@ -193,13 +260,30 @@ const flowerTaskDefinition = new aws.ecs.TaskDefinition('flower-task-definition'
 
 const airflower = new aws.ecs.Service('airflower', {
   cluster: cluster.arn,
-  taskDefinition: flowerTaskDefinition.arn
+
+  networkConfiguration:{
+    assignPublicIp:true,
+    subnets: subnetIds,
+    securityGroups:securityGroupIds,
+  },
+  taskDefinition: flowerTaskDefinition.arn,
+  loadBalancers:[{
+    targetGroupArn:airflowerTargetGroup.arn,
+    containerName: 'notflower',
+    containerPort: 5555,
+  }]
 })
 
 const workerImage = new awsx.ecr.Image("worker", { repositoryUrl: repo.repositoryUrl, path: "./airflow-container" })
 
 const workerTaskDefinition = new aws.ecs.TaskDefinition('worker-task-definition', {
   family: 'my-special-family',
+  taskRoleArn : testRole.arn,
+  executionRoleArn: testRole.arn,
+  requiresCompatibilities:['FARGATE'],
+  cpu:"1024",
+  memory:'2048',
+  networkMode:'awsvpc',
   containerDefinitions:pulumi
   .all([workerImage.imageUri, environment])
   .apply( ([image, environment]) =>
@@ -218,6 +302,12 @@ const workerTaskDefinition = new aws.ecs.TaskDefinition('worker-task-definition'
 
 const airflowWorkers = new aws.ecs.Service("airflow-workers", {
   cluster: cluster.arn,
+
+  networkConfiguration:{
+    assignPublicIp:true,
+    subnets: subnetIds,
+    securityGroups:securityGroupIds,
+  },
   desiredCount: 3,
   taskDefinition: workerTaskDefinition.arn
 });
